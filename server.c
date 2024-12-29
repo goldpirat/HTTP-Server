@@ -4,138 +4,153 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 
-#define MAX_REQUEST_LENGTH 1024  
-#define SERVER_PORT 8080       
-#define MAX_THREADS 30         
+#define MAX_REQUEST_SIZE 1024
+#define PORT 8080
+#define NR_OF_THREADS 30
 
-// Structure to hold thread arguments
-typedef struct {
-    int client_fd;             
-    pthread_mutex_t post_mutex; 
-} ThreadArgs;
+struct args {
+    int client_socket;
+    pthread_mutex_t POST_lock;
+};
 
 
-// Thread function to handle client connections
-static void *handle_client(void *arg) { 
-    ThreadArgs *thread_args = (ThreadArgs *)arg;
-    int client_fd = thread_args->client_fd;
+// Function to handle client connection
+static void *handle_connection(void *arg) {
+    struct args *args = (struct args*) arg;
 
-    char request[MAX_REQUEST_LENGTH];
-    ssize_t bytes_received = recv(client_fd, request, MAX_REQUEST_LENGTH, 0);
+    // create buffer for request
+    char request_buffer[MAX_REQUEST_SIZE];
+    int request_size;
 
-    if (bytes_received < 0) {
-        perror("recv failed");
-        close(client_fd);
-        return NULL;
-    } else if (bytes_received == 0) {
-        printf("Client disconnected.\n");
-        close(client_fd);
+    // receive the request
+    request_size = recv(args->client_socket, request_buffer, MAX_REQUEST_SIZE, 0);
+    if (request_size == -1) {
+        perror("recv");
+        close(args->client_socket);
         return NULL;
     }
+    puts("Request received!");
 
-    printf("Request received:\n%.*s\n", (int)bytes_received, request); // Print received request
+    // parse the request
+    struct message new_request;
+    if (parse_request(&new_request, request_buffer, request_size) == -1) {
+        fprintf(stderr, "parse_request: error");
+        
+        // send bad request message
+        char *bad_request_response = 
+        "HTTP/1.1 400 Bad Request\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 11\r\n"
+        "\r\n\r\n"
+        "Bad Request";
 
-    struct message client_request;
-    if (parse_request(&client_request, request, bytes_received) < 0) {
-        fprintf(stderr, "Error parsing request.\n");
+        if (send(args->client_socket, bad_request_response, strlen(bad_request_response), 0) == -1) {
+            perror("send");
+        }
 
-        // Send 400 Bad Request
-        const char *bad_request = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request";
-        send(client_fd, bad_request, strlen(bad_request), 0);
-
-        message_cleanup(&client_request);
-        close(client_fd);
+        message_cleanup(&new_request);
+        close(args->client_socket);
         return NULL;
     }
+    puts("Request parsed!");
 
-    struct message server_response;
-    if (create_response(&client_request, &server_response, &thread_args->post_mutex) < 0) {
-        fprintf(stderr, "Error creating response.\n");
-        message_cleanup(&client_request);
-        close(client_fd);
+    // create response
+    struct message new_response;
+    if (create_response(&new_request, &new_response, &args->POST_lock) == -1) {
+        fprintf(stderr, "create_response: error");
+        message_cleanup(&new_request);
+        close(args->client_socket);
         return NULL;
     }
+    puts("Response created!");
 
-    // Construct response string
-    size_t response_length = strlen(server_response.line) + strlen(server_response.headers) + strlen(server_response.body) + 6;
-    char response[response_length];
-    snprintf(response, response_length, "%s\r\n%s\r\n\r\n%s", server_response.line, server_response.headers, server_response.body);
+    // 6 is the number of '\r' and '\n' characters that are needed in the response
+    int response_size = strlen(new_response.line) + strlen(new_response.headers) 
+                        + strlen(new_response.body) + 6;
+    char response_buffer[response_size];
+    sprintf(response_buffer, "%s\r\n"
+                                "%s\r\n"
+                                "\r\n"
+                                "%s",
+                                new_response.line, new_response.headers, new_response.body);
+    send(args->client_socket, response_buffer, response_size, 0);
 
-    send(client_fd, response, strlen(response), 0);
+    puts(response_buffer);
 
-    printf("Response sent:\n%s\n", response); // Print sent response
-
-    message_cleanup(&client_request);
-    message_cleanup(&server_response);
-    close(client_fd);
+    message_cleanup(&new_request);
+    message_cleanup(&new_response);
+    close(args->client_socket);
 
     return NULL;
 }
 
 int main(void) {
-    // Create socket
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("Socket creation failed");
+    // create the socket
+    int main_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (main_socket == -1) {
+        perror("socket");
         return EXIT_FAILURE;
     }
-    printf("Socket created.\n");
+    puts("Socket Created!");
 
-    // Set SO_REUSEADDR option
-    int reuse_addr = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) < 0) {
-        perror("setsockopt failed");
-        close(server_fd);
+    int reuse = 1;
+    if (setsockopt(main_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == -1) {
+        perror("setsockopt");
+        close(main_socket);
         return EXIT_FAILURE;
     }
 
-    // Set up server address
-    struct sockaddr_in server_addr = {0};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
-    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    // set up port and address for the socket
+    struct sockaddr_in host;
+    socklen_t host_len = sizeof(host);
 
-    // Bind socket to address
-    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-        perror("Bind failed");
-        close(server_fd);
+    host.sin_family = AF_INET;
+    host.sin_port = htons(PORT);
+    host.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    // bind the socket to that port and address
+    if (bind(main_socket, (struct sockaddr *) &host, host_len) == -1) {
+        perror("bind");
+        close(main_socket);
         return EXIT_FAILURE;
     }
-    printf("Socket bound to port %d.\n", SERVER_PORT);
+    puts("Socket Binded!");
 
     while (1) {
-        // Listen for connections
-        if (listen(server_fd, MAX_THREADS) < 0) {
-            perror("Listen failed");
-            close(server_fd);
+        // wait for connection request
+        if (listen(main_socket, NR_OF_THREADS) == -1) {
+            perror("listen");
+            close(main_socket);
+            return EXIT_FAILURE;
+        }
+        
+        // accept the connection request
+        int client_socket = accept(main_socket, (struct sockaddr *)&host, &host_len);
+        if (client_socket == -1) {
+            perror("accept");
+            close(main_socket);
+            return EXIT_FAILURE;
+        }
+        puts("Connection accepted!");
+
+        struct args args = { .client_socket = client_socket, .POST_lock = PTHREAD_MUTEX_INITIALIZER };
+
+        // create the the thread
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_connection, &args)) {
+            perror("pthread_create");
+            close(client_socket);
             return EXIT_FAILURE;
         }
 
-        // Accept connection
-        struct sockaddr_in client_addr;
-        socklen_t client_addr_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_len);
-        if (client_fd < 0) {
-            perror("Accept failed");
-            close(server_fd);
+        // join it back
+        if (pthread_detach(tid)) {  
+            perror("pthread_detach");
+            close(client_socket);
             return EXIT_FAILURE;
         }
-        printf("Connection accepted.\n");
-
-        ThreadArgs thread_args = { .client_fd = client_fd, .post_mutex = PTHREAD_MUTEX_INITIALIZER };
-
-        // Create thread
-        pthread_t thread_id;
-        if (pthread_create(&thread_id, NULL, handle_client, &thread_args) != 0) {
-            perror("Thread creation failed");
-            close(client_fd);
-            continue; // Continue accepting other clients
-        }
-
-        // Detach thread
-        pthread_detach(thread_id);
     }
 
-    close(server_fd);
+    close(main_socket);
     return EXIT_SUCCESS;
 }

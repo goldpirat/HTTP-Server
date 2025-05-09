@@ -224,7 +224,7 @@ char *get_resource_type(char *resource) {
 int set_headers(struct message *resp, char *resource_type, int body_length) {
     // get the potenial size
     int headers_length = snprintf(NULL, 0, "Content-Type: %s\r\n"
-                                            "Server: jlumi/1.0\r\n"
+                                            "Server: flori/1.0\r\n"
                                             "Content-Length: %d",
                                             resource_type, body_length) + 1;
     if (headers_length < 0) {
@@ -235,7 +235,7 @@ int set_headers(struct message *resp, char *resource_type, int body_length) {
     // allocate memory for the headers and put them into the message component
     resp->headers = malloc(headers_length);
     if (sprintf(resp->headers, "Content-Type: %s\r\n"
-                               "Server: jlumi/1.0\r\n"
+                               "Server: flori/1.0\r\n"
                                "Content-Length: %d", 
                                resource_type, body_length) == -1) {
         perror("sprintf");
